@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -26,17 +27,23 @@
  * @param endValue The ending value of the range (exclusive).
  * @param targetCrc32 The desired final CRC32 value.
  * @param precomputedCrc The intermediate CRC32 value calculated up to the point before the 4 bytes.
+ * @param found Reference to atomic flag for cooperative cancellation.
  * @return An optional containing the matching 4-byte value if found, otherwise std::nullopt.
  */
 std::optional<uint32_t> pickMatchingCrc(uint64_t startValue, uint64_t endValue,
-                                          uint32_t targetCrc32, uint32_t precomputedCrc)
+                                          uint32_t targetCrc32, uint32_t precomputedCrc,
+                                          std::atomic<bool>& found)
 {
-    for(uint64_t iLong = startValue; iLong < endValue; ++iLong)
+    constexpr uint64_t CHECK_INTERVAL = 10000;
+    for(uint64_t iLong = startValue, check = 0; iLong < endValue; ++iLong, ++check)
     {
+        if (check % CHECK_INTERVAL == 0 && found.load(std::memory_order_relaxed))
+            return std::nullopt;
         uint32_t i = static_cast<uint32_t>(iLong);
         auto currentCrc32 = crc32Final(reinterpret_cast<const char*>(&i), sizeof(i), precomputedCrc);
         if(currentCrc32 == targetCrc32)
         {
+            found.store(true, std::memory_order_relaxed);
             return i; // Found it!
         }
     }
@@ -74,6 +81,7 @@ std::vector<char> hack(const std::vector<char> &original,
     const uint32_t currentCrc32Precompute = crc32Intermediate(result.data(), original.size() + injection.size());
 
 #if defined(USE_MULTI_THREADING) && USE_MULTI_THREADING == 1
+    std::atomic<bool> found{false};
     /* 
       --- Benchmarking Phase --- 
       For dynamic balancing of threads
@@ -108,27 +116,17 @@ std::vector<char> hack(const std::vector<char> &original,
       for(unsigned int i = 0; i < threadNumber; ++i)
       {
         uint64_t valueEnd = valueStart + valuesPerThread;
-        /**
-         * Distribute remainder to the last thread
-         * if it's the last thread
-         */
         if(i == threadNumber - 1)
         {
           valueEnd = benchmark_range_size; // End at benchmark size
         }
-        /**
-         * Launch a thread to find a matching CRC
-         */
         futures.push_back(std::async(std::launch::async, pickMatchingCrc,
-                                        valueStart, valueEnd,
-                                        originalCrc32, currentCrc32Precompute));
+                                    valueStart, valueEnd,
+                                    originalCrc32, currentCrc32Precompute,
+                                    std::ref(found)));
         valueStart = valueEnd;
       }
 
-      /**
-       * Wait for benchmark threads to finish
-       * and collect results
-       */
       for(auto& fut : futures)
       {
         fut.get(); // We don't care about the result in the benchmark phase
@@ -140,9 +138,6 @@ std::vector<char> hack(const std::vector<char> &original,
       std::cout << "  " << threadNumber << " threads: " << durations[threadNumber] << " ms" << std::endl;
     }
 
-    /**
-     * Determine optimal thread amount
-     */
     unsigned int threadsAmountOptimal = 1;
     double minTime = std::numeric_limits<double>::max();
     if(durations.empty() == false)
@@ -164,10 +159,8 @@ std::vector<char> hack(const std::vector<char> &original,
     std::cout << "Optimal thread count: " << threadsAmountOptimal << " (Benchmark time: " << minTime << " ms)" << std::endl;
     std::cout << "Starting full search..." << std::endl;
 
-    /**
-     * --- Full Parallel Search Phase ---
-     * Distribute the range into threadsAmountOptimal threads
-     */
+    // Reset the flag before the full search
+    found.store(false, std::memory_order_relaxed);
     std::vector<std::future<std::optional<uint32_t>>> futuresPick;
     uint64_t valuesPerThreadFull = rangeSizeTotal / threadsAmountOptimal;
     uint64_t valueStartFull = 0;
@@ -177,25 +170,17 @@ std::vector<char> hack(const std::vector<char> &original,
     for(unsigned int i = 0; i < threadsAmountOptimal; ++i)
     {
       uint64_t valueEndFull = valueStartFull + valuesPerThreadFull;
-      /**
-       * Distribute remainder and ensure the last thread covers up to UINT32_MAX
-       */
       if(i == threadsAmountOptimal - 1)
       {
         valueEndFull = rangeSizeTotal; 
       }
-      /**
-       * Launch a thread to find a matching CRC
-       */
       futuresPick.push_back(std::async(std::launch::async, pickMatchingCrc,
-                                          valueStartFull, valueEndFull,
-                                          originalCrc32, currentCrc32Precompute));
+                                         valueStartFull, valueEndFull,
+                                         originalCrc32, currentCrc32Precompute,
+                                         std::ref(found)));
       valueStartFull = valueEndFull;
     }
 
-    /**
-     * Collect results
-     */
     std::optional<uint32_t> foundValue = std::nullopt;
     for(auto& fut : futuresPick)
     {
@@ -203,11 +188,6 @@ std::vector<char> hack(const std::vector<char> &original,
       if(threadResult.has_value())
       {
         foundValue = threadResult;
-        /**
-         * Optional: Could signal other threads to stop here, but std::async doesn't directly support cancellation.
-         * Moreover, it's told in task description that we should not use threads synchronization primitives.
-         * So we'll just let them finish and take the first result found.
-         */
         break; 
       }
     }
@@ -219,9 +199,6 @@ std::vector<char> hack(const std::vector<char> &original,
     if(foundValue.has_value())
     {
       uint32_t i = foundValue.value();
-      /* 
-       *  Finally replace last 4 bytes of the result vector with the found value
-       */
       replaceLastFourBytes(result, i);
       std::cout << "Bytes to add: 0x" << std::setw(8) << std::setfill('0') << std::hex << htobe32(i) << std::dec << std::endl;
       return result;
